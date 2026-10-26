@@ -1,0 +1,5 @@
+.git
+docs
+infra
+__pycache__
+.pytest_cache

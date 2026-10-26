@@ -1,0 +1,285 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  QuickBite capstone platform - virtual data centre (VPC across 2 AZs), ALB, ECS Fargate service,
+  ECR, DynamoDB orders table, least-privilege IAM, CloudWatch logs/alarms/dashboard and SNS alerts.
+  Jenkins deploys new versions by updating ImageTag on this stack.
+
+Parameters:
+  ImageTag:
+    Type: String
+    Default: bootstrap
+    Description: Container image tag in ECR, set by the CI/CD pipeline (Jenkins build number)
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 4
+  VpcCidr:
+    Type: String
+    Default: 10.50.0.0/16
+
+Resources:
+  # ---------- Virtual data centre: network ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: quickbite-vpc}]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: quickbite-igw}]
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway}
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: quickbite-public-a}]
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: quickbite-public-b}]
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: quickbite-public-rt}]
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties: {RouteTableId: !Ref RouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway}
+  SubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref SubnetA, RouteTableId: !Ref RouteTable}
+  SubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref SubnetB, RouteTableId: !Ref RouteTable}
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP to the load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}]
+      Tags: [{Key: Name, Value: quickbite-alb-sg}]
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App port from the load balancer only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref AlbSecurityGroup}]
+      Tags: [{Key: Name, Value: quickbite-task-sg}]
+
+  # ---------- Load balancing ----------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: quickbite-alb
+      Scheme: internet-facing
+      Subnets: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: quickbite-tg
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 8000
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      TargetGroupAttributes: [{Key: deregistration_delay.timeout_seconds, Value: "15"}]
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref TargetGroup}]
+
+  # ---------- Data ----------
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: quickbite-orders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: order_id, AttributeType: S}]
+      KeySchema: [{AttributeName: order_id, KeyType: HASH}]
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  # ---------- Containers ----------
+  Repository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    Properties:
+      RepositoryName: quickbite
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: {ScanOnPush: true}
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep 10","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /ecs/quickbite, RetentionInDays: 7}
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties: {ClusterName: quickbite-cluster}
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: orders-table-only
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Scan]
+                Resource: !GetAtt OrdersTable.Arn
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: quickbite
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: quickbite
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/quickbite:${ImageTag}"
+          Essential: true
+          PortMappings: [{ContainerPort: 8000}]
+          Environment:
+            - {Name: ORDERS_TABLE, Value: !Ref OrdersTable}
+            - {Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region}
+            - {Name: BUILD_NUMBER, Value: !Ref ImageTag}
+          ReadonlyRootFilesystem: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: {awslogs-group: !Ref LogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: web}
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      ServiceName: quickbite-service
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetA, !Ref SubnetB]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      LoadBalancers: [{ContainerName: quickbite, ContainerPort: 8000, TargetGroupArn: !Ref TargetGroup}]
+
+  # ---------- Monitoring and alerting ----------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties: {TopicName: quickbite-alerts}
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: quickbite-unhealthy-targets
+      AlarmDescription: A QuickBite container is failing health checks
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
+        - {Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  Http5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: quickbite-5xx-errors
+      AlarmDescription: QuickBite is returning server errors
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions: [{Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: quickbite-high-cpu
+      AlarmDescription: QuickBite service CPU above 75%
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Dimensions:
+        - {Name: ClusterName, Value: !Ref Cluster}
+        - {Name: ServiceName, Value: quickbite-service}
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 75
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: quickbite-operations
+      DashboardBody: !Sub
+        - |
+          {"widgets":[
+           {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Requests per minute","region":"${AWS::Region}","stat":"Sum","period":60,
+             "metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${Lb}"]]}},
+           {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Response time (s)","region":"${AWS::Region}","stat":"Average","period":60,
+             "metrics":[["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${Lb}"]]}},
+           {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Healthy / unhealthy containers","region":"${AWS::Region}","stat":"Maximum","period":60,
+             "metrics":[["AWS/ApplicationELB","HealthyHostCount","LoadBalancer","${Lb}","TargetGroup","${Tg}"],[".","UnHealthyHostCount",".",".",".","."]]}},
+           {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"ECS CPU / memory %","region":"${AWS::Region}","stat":"Average","period":60,
+             "metrics":[["AWS/ECS","CPUUtilization","ClusterName","quickbite-cluster","ServiceName","quickbite-service"],[".","MemoryUtilization",".",".",".","."]]}},
+           {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{"title":"Orders table writes","region":"${AWS::Region}","stat":"Sum","period":60,
+             "metrics":[["AWS/DynamoDB","ConsumedWriteCapacityUnits","TableName","quickbite-orders"]]}},
+           {"type":"alarm","x":12,"y":12,"width":12,"height":6,"properties":{"title":"Alarms","alarms":["${A1}","${A2}","${A3}"]}}
+          ]}
+        - Lb: !GetAtt LoadBalancer.LoadBalancerFullName
+          Tg: !GetAtt TargetGroup.TargetGroupFullName
+          A1: !GetAtt UnhealthyHostsAlarm.Arn
+          A2: !GetAtt Http5xxAlarm.Arn
+          A3: !GetAtt HighCpuAlarm.Arn
+
+Outputs:
+  AppURL:
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+  OrdersTableName:
+    Value: !Ref OrdersTable
