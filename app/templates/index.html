@@ -15,7 +15,7 @@
   .status{font-size:12px;font-weight:700;background:#ecfdf3;color:#067647;border-radius:6px;padding:2px 8px}
 </style></head>
 <body>
-<header><h1>QuickBite</h1><p>Order food from local kitchens · delivered by a Cloud DevOps pipeline</p></header>
+<header><h1>QuickBite</h1><p>Order food from local kitchens · delivered by a Cloud DevOps pipeline · now with live delivery estimates</p></header>
 <main>
   <section class="card"><div class="pills">
     <span class="pill">Version {{ version }}</span><span class="pill">Build #{{ build }}</span>
@@ -29,11 +29,11 @@
       <input id="qty" type="number" min="1" max="20" value="1" style="width:80px"><button>Place order</button></form>
   </section>
   <section class="card"><h2 style="margin-top:0">Recent orders</h2>
-    <table><tr><th>Order</th><th>Customer</th><th>Items</th><th class="r">Total (₹)</th><th>Status</th></tr>
+    <table><tr><th>Order</th><th>Customer</th><th>Items</th><th class="r">Total (₹)</th><th>Status</th><th class="r">ETA</th></tr>
     {% for o in orders %}<tr><td><code>{{ o.order_id }}</code></td><td>{{ o.customer }}</td>
       <td>{% for i in o["items"] %}{{ i.qty }}× {{ i.name }}{% if not loop.last %}, {% endif %}{% endfor %}</td>
-      <td class="r">{{ o.total }}</td><td><span class="status">{{ o.status }}</span></td></tr>
-    {% else %}<tr><td colspan="5" style="color:#667085">No orders yet</td></tr>{% endfor %}</table>
+      <td class="r">{{ o.total }}</td><td><span class="status">{{ o.status }}</span></td><td class="r">{{ o.eta_minutes ~ " min" if o.eta_minutes else "–" }}</td></tr>
+    {% else %}<tr><td colspan="6" style="color:#667085">No orders yet</td></tr>{% endfor %}</table>
   </section>
 </main>
 <script>

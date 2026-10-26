@@ -42,3 +42,8 @@ def test_unknown_order_404():
 def test_home_page():
     res = client().get("/")
     assert res.status_code == 200 and b"QuickBite" in res.data
+
+
+def test_order_has_delivery_estimate():
+    o = client().post("/api/orders", json={"customer": "Dev", "items": [{"id": "m1", "qty": 3}]}).get_json()
+    assert o["eta_minutes"] == 35

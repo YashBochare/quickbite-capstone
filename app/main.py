@@ -102,6 +102,7 @@ def create_app(store=None):
             "items": items,
             "total": sum(i["price"] * i["qty"] for i in items),
             "status": STATUSES[0],
+            "eta_minutes": 20 + 5 * sum(i["qty"] for i in items),
             "created_at": int(time.time()),
         }
         store.put(order)
